@@ -2,7 +2,7 @@
 
 고객 CSV를 올리면 **데이터 품질 점검 → R·F·M 컬럼 지정 → 가중치 조절 → 고객 세그먼트**까지 한 화면에서 보여주는 Streamlit 웹앱입니다.
 
-🔗 **웹에서 바로 써보기:** (배포 후 링크 추가)
+🔗 **웹에서 바로 써보기:** ((https://rfm-segment-web-j25wmxqn5dapph6pt6lqmnx.streamlit.app/))
 
 ## 만든 이유
 
