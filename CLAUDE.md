@@ -20,7 +20,7 @@
 ## 파일 구성
 
 ```
-app.py            # 화면 (Streamlit). 1.업로드 → 2.품질 점검 → 3.컬럼 지정 → 4.가중치 → 5.결과 → 6.처리 기록
+app.py            # 화면 (Streamlit). 1.업로드 → 2.품질 점검(현황) → 3.컬럼 지정(+결측 처리) → 4.세그먼트 기준 → 5.결과 → 6.처리 기록
 rfm_core.py       # 분석 로직. 화면과 분리해 둠 (불러오기, 품질 점검, R·F·M 계산, 점수화, 세그먼트)
 requirements.txt  # streamlit, pandas, numpy, plotly
 .gitignore        # *.csv 제외 (sample_data/*.csv만 허용)
