@@ -99,6 +99,11 @@ def load(raw: bytes) -> pd.DataFrame:
 
 
 df_raw = load(up.getvalue() if up is not None else open(dev_file, "rb").read())
+file_name = up.name if up is not None else os.path.basename(dev_file)
+# 처리 기록: 화면에서 내린 판단을 소제목별로 모은다 (6. 처리 기록에서 보여주고 .md로 내려받기)
+logs = {"데이터": [f"파일 이름: {file_name}", f"원래 크기: {df_raw.shape[0]:,}행 × {df_raw.shape[1]}열",
+                  f"데이터 형태: {'고객 합산형' if kind.startswith('고객') else '거래형'}"],
+        "컬럼 지정": [], "데이터 정리": [], "세그먼트 기준": [], "특성 비교 설정": []}
 st.success(f"불러오기 완료: {df_raw.shape[0]:,}행 × {df_raw.shape[1]}열")
 with st.expander("원본 미리보기"):
     st.dataframe(df_raw.head(20), width="stretch")
@@ -115,7 +120,7 @@ c3.metric("중복 행", q["duplicated_rows"])
 c4.metric("극단값 있는 컬럼", len(q["outliers"]))
 
 df = df_raw.copy()
-notes = []
+drop_out_cols, n_extreme, n_dup = [], 0, 0
 
 if q["missing"]:
     st.subheader("결측값 (현황)")
@@ -129,12 +134,12 @@ if q["constant"]:
     st.subheader("값이 하나뿐인 컬럼")
     st.write("모든 행의 값이 같아서 고객을 구분하는 데 쓸 수 없습니다: " + ", ".join(f"`{c}`" for c in q["constant"]))
     df = df.drop(columns=q["constant"])
-    notes.append(f"분석에서 제외한 컬럼: {', '.join(q['constant'])}")
+    logs["데이터 정리"].append(f"제외한 컬럼 (값이 하나뿐): {', '.join(map(str, q['constant']))}")
 
 if q["duplicated_rows"]:
     if st.checkbox(f"완전히 같은 중복 행 {q['duplicated_rows']}개 제거", value=True):
         df = df.drop_duplicates()
-        notes.append(f"중복 행 {q['duplicated_rows']}개 제거")
+        n_dup = q["duplicated_rows"]
 
 if q["outliers"]:
     st.subheader("극단값 (사분위 범위의 3배 밖)")
@@ -145,8 +150,7 @@ if q["outliers"]:
     st.dataframe(ot, width="stretch")
     drop_out_cols = st.multiselect("극단값 행을 제외할 컬럼", [c for c in q["outliers"] if c in df.columns])
     if drop_out_cols:
-        df, n = rc.drop_extreme(df, drop_out_cols)
-        notes.append(f"극단값 행 {n}개 제외 ({', '.join(drop_out_cols)})")
+        df, n_extreme = rc.drop_extreme(df, drop_out_cols)
 
 # ------------------------------------------------------------------ 3. 컬럼 지정
 st.header("3. R·F·M 컬럼 지정")
@@ -160,28 +164,31 @@ def idx(options, value):
 
 if kind.startswith("고객"):
     a, b = st.columns(2)
+    g_id, g_rec = rc.guess_columns(df, "customer_id"), rc.guess_columns(df, "recency")
     id_col = a.selectbox("고객 ID", ["(행 번호 사용)"] + cols,
-                         index=idx(["(행 번호 사용)"] + cols, rc.guess_columns(df, "customer_id")))
+                         index=idx(["(행 번호 사용)"] + cols, g_id))
     rec_col = b.selectbox("최근성 (마지막 구매 후 경과일)", num_cols,
-                          index=idx(num_cols, rc.guess_columns(df, "recency")))
+                          index=idx(num_cols, g_rec))
     f_guess = [c for c in rc.guess_columns(df, "frequency", True) if "discount" not in c.lower()]
+    m_guess = rc.guess_columns(df, "monetary", True)
     freq_cols = st.multiselect("빈도 (더할 구매 횟수 컬럼)", num_cols, default=f_guess,
                                help="할인 구매처럼 다른 횟수와 겹칠 수 있는 컬럼은 이중 집계가 되지 않는지 확인하세요.")
-    money_cols = st.multiselect("금액 (더할 구매 금액 컬럼)", num_cols,
-                                default=rc.guess_columns(df, "monetary", True))
+    money_cols = st.multiselect("금액 (더할 구매 금액 컬럼)", num_cols, default=m_guess)
     if not (freq_cols and money_cols):
         st.warning("빈도와 금액 컬럼을 하나 이상 골라 주세요.")
         st.stop()
     rfm, miss_info = rc.rfm_from_customer_table(df, None if id_col.startswith("(") else id_col,
                                                 rec_col, freq_cols, money_cols)
     used_cols = [c for c in [id_col, rec_col] + freq_cols + money_cols if c in df.columns]
-    notes.append(f"빈도 = {' + '.join(freq_cols)}")
+    col_log = [("고객 ID", id_col, g_id or "(행 번호 사용)"), ("최근성", rec_col, g_rec),
+               ("빈도", freq_cols, f_guess), ("금액", money_cols, m_guess)]
 else:
     a, b, c = st.columns(3)
-    id_col = a.selectbox("고객 ID", cols, index=idx(cols, rc.guess_columns(df, "customer_id")))
-    date_col = b.selectbox("거래 일시", cols, index=idx(cols, rc.guess_columns(df, "date")))
+    g_id, g_date, g_inv = (rc.guess_columns(df, r) for r in ("customer_id", "date", "invoice"))
+    id_col = a.selectbox("고객 ID", cols, index=idx(cols, g_id))
+    date_col = b.selectbox("거래 일시", cols, index=idx(cols, g_date))
     inv_col = c.selectbox("주문 번호 (없으면 날짜로 횟수 계산)", ["(없음)"] + cols,
-                          index=idx(["(없음)"] + cols, rc.guess_columns(df, "invoice")))
+                          index=idx(["(없음)"] + cols, g_inv))
     mode = st.radio("금액 계산", ["금액 컬럼 사용", "수량 × 단가"], horizontal=True,
                     index=1 if rc.guess_columns(df, "quantity") else 0)
     if mode == "금액 컬럼 사용":
@@ -200,8 +207,22 @@ else:
     miss_info = {"total": log["start"], "dropped": log["dropped_missing"],
                  "dropped_rate": log["dropped_missing"] / max(log["start"], 1), "unit": "거래"}
     used_cols = [c for c in [id_col, date_col, inv_col, amt_col, qty_col, price_col] if c and c in df.columns]
-    notes.append(f"거래 {log['start']:,}건 → 고객 {log['customers']:,}명 (기준일 {log['ref_date']}, "
-                 f"결측 {log['dropped_missing']:,}건·0 이하 {log.get('dropped_nonpositive', 0):,}건 제외)")
+    col_log = [("고객 ID", id_col, g_id), ("거래 일시", date_col, g_date), ("주문 번호", inv_col, g_inv or "(없음)")]
+    if amt_col:
+        col_log.append(("금액", amt_col, rc.guess_columns(df, "monetary")))
+    else:
+        col_log += [("수량", qty_col, rc.guess_columns(df, "quantity")), ("단가", price_col, rc.guess_columns(df, "price"))]
+    logs["데이터"] += [f"거래 {log['start']:,}건 → 고객 {log['customers']:,}명",
+                      f"분석 기준일: {log['ref_date']} ({'직접 지정' if ref else '마지막 거래 다음 날'})",
+                      f"취소·반품(금액 0 이하) 제외: {log['dropped_nonpositive']:,}건" if drop_neg
+                      else "취소·반품(금액 0 이하) 제외: 제외하지 않음"]
+for role, chosen, guess in col_log:
+    show_ = " + ".join(map(str, chosen)) if isinstance(chosen, list) else str(chosen)
+    if isinstance(chosen, list):
+        how = "자동 인식 그대로" if list(chosen) == list(guess) else "사용자가 바꿈"
+    else:
+        how = "자동 인식 그대로" if chosen == guess else f"사용자가 바꿈 (자동 인식: {guess or '없음'})"
+    logs["컬럼 지정"].append(f"{role}: {show_} — {how}")
 
 # ------------------------------------------------------------------ 결측 처리 (컬럼 지정 후 적용)
 st.subheader("결측값 처리")
@@ -212,10 +233,11 @@ if miss_info["dropped"]:
     if miss_info["dropped_rate"] >= rc.MISSING_EXCLUDE:
         st.warning(f"제외된 {unit}이 전체의 {miss_info['dropped_rate']:.0%}입니다. "
                    "결과가 전체를 대표하지 못할 수 있으니 데이터를 확인해 주세요.")
-    notes.append(f"R·F·M 컬럼 결측으로 {unit} {miss_info['dropped']:,}{'건' if unit == '거래' else '명'} "
-                 f"({miss_info['dropped_rate']:.1%}) 제외")
+    logs["데이터 정리"].append(f"R·F·M 컬럼 결측으로 제외한 {unit}: {miss_info['dropped']:,}"
+                              f"{'건' if unit == '거래' else '명'} ({miss_info['dropped_rate']:.1%})")
 else:
     st.markdown("R·F·M 계산에 쓰는 컬럼에는 빈 값이 없습니다.")
+    logs["데이터 정리"].append("R·F·M 컬럼 결측: 없음")
 other_na = rc.other_missing(df, used_cols)
 if len(other_na):
     st.markdown("R·F·M에 쓰지 않는 컬럼은 고객을 빼지 않고, 특성 비교에서만 빈 값을 빼고 계산합니다.")
@@ -223,7 +245,11 @@ if len(other_na):
     for _, r in other_na.iterrows():
         if r["처리"].startswith("사용 ("):
             st.warning(f"`{r['컬럼']}`은 결측이 {r['비율']:.1%}로 많아 특성 비교 결과를 해석할 때 주의가 필요해요.")
-        notes.append(f"{r['컬럼']} 결측 {r['결측 수']:,}{'건' if unit == '거래' else '명'}({r['비율']:.1%}) — 제외하지 않음, {r['처리']}")
+        logs["데이터 정리"].append(f"{r['컬럼']} 결측 {r['결측 수']:,}{'건' if unit == '거래' else '명'}({r['비율']:.1%}) — 제외하지 않음, {r['처리']}")
+
+logs["데이터 정리"].append(f"중복 행 제거: {n_dup:,}행" if n_dup else "중복 행 제거: 없음")
+logs["데이터 정리"].append(f"극단값 제외: {', '.join(map(str, drop_out_cols))} → {n_extreme:,}행 제외"
+                         if drop_out_cols else "극단값 제외 안 함")
 
 if len(rfm) < 10:
     st.error("고객 수가 너무 적어 점수를 나눌 수 없습니다.")
@@ -452,12 +478,40 @@ if kind.startswith("고객"):
         st.plotly_chart(fig5, width="stretch")
 
 # ------------------------------------------------------------------ 6. 처리 기록과 내려받기
-st.header("6. 처리 기록")
-st.caption("어떤 판단으로 데이터를 다뤘는지 남겨 두면 결과를 다시 검증할 수 있습니다.")
-for n in notes:
-    st.markdown(f"- {n}")
-st.markdown(f"- 세그먼트 기준: {preset} (F:M = {wf:g}:{wm:g}), 점수는 1~5점 (순위 기준 5등분)")
+logs["세그먼트 기준"] = [
+    f"분석 목표: {preset} (F:M = {wf:g}:{wm:g})",
+    f"균형(1:1) 대비 세그먼트가 바뀐 고객: {sens['changed']:,}명",
+    "점수: R·F·M을 순위 기준 5등분해 1~5점 (R은 최근일수록 높음)",
+    "가치 점수 V = (wF×F + wM×M) / (wF + wM)",
+    "규칙: " + " / ".join(f"{k}: {v}" for k, v in rc.SEGMENT_RULES.items() if k != "일반") + " / 일반: 나머지",
+]
+if kind.startswith("고객"):
+    if ref_year:
+        logs["특성 비교 설정"].append(f"나이 변환 기준 연도: {ref_year}")
+    if prof_methods:
+        logs["특성 비교 설정"].append("컬럼별 계산 방식: " + ", ".join(f"{k} ({v})" for k, v in prof_methods.items()))
+    logs["특성 비교 설정"].append("차이가 작아 문장으로 표시한 컬럼 (최대 차이 5% 미만): "
+                              + (", ".join(small_cols) if small_cols else "없음"))
+    if skipped:
+        logs["특성 비교 설정"].append("비교에서 제외한 컬럼: " + ", ".join(f"{x['col']} ({x['reason']})" for x in skipped))
+else:
+    logs["특성 비교 설정"].append("거래형 데이터는 고객 특성 컬럼이 없어 특성 비교를 하지 않음")
 
-st.download_button("세그먼트 결과 CSV 내려받기",
-                   scored.to_csv(index=False).encode("utf-8-sig"),
-                   file_name="rfm_segments.csv", mime="text/csv")
+report = "# RFM 세그먼트 분석 처리 기록\n\n" + "\n\n".join(
+    f"## {i}) {sec}\n\n" + "\n".join(f"- {line}" for line in lines)
+    for i, (sec, lines) in enumerate(logs.items(), 1)) + "\n"
+
+st.header("6. 처리 기록")
+st.caption("어떤 판단으로 데이터를 다뤘는지 남겨 두면 결과를 다시 검증할 수 있습니다. 보고서에 그대로 붙여 넣을 수 있어요.")
+for i, (sec, lines) in enumerate(logs.items(), 1):
+    st.markdown(f"**{i}) {sec}**\n\n" + "\n".join(f"- {line}" for line in lines))
+with st.expander("복사용 텍스트 (오른쪽 위 버튼으로 복사)"):
+    st.code(report, language="markdown")
+
+out = scored.rename(columns={"customer_id": "고객 ID"})[
+    ["고객 ID", "recency", "frequency", "monetary", "R", "F", "M", "V", "segment"]]
+a, b = st.columns(2)
+a.download_button("처리 기록 내려받기 (.md)", report.encode("utf-8"),
+                  file_name="rfm_처리기록.md", mime="text/markdown")
+b.download_button("세그먼트 결과 CSV 내려받기", out.to_csv(index=False).encode("utf-8-sig"),
+                  file_name=f"rfm_segments_{preset.replace(' ', '')}.csv", mime="text/csv")
