@@ -311,6 +311,20 @@ else:
 with st.expander("세그먼트 규칙 보기"):
     st.markdown("\n".join(f"- **{k}**: {v}" for k, v in rc.SEGMENT_RULES.items()))
 
+# 점수별 고객 수: 같은 값은 같은 점수를 받으므로 각 점수가 정확히 20%가 아닐 수 있다
+score_tbl = rc.score_table(scored)
+ties = rc.tie_conflicts(scored)
+with st.expander("점수별 고객 수 보기 (구간이 고르게 나뉘었는지 확인)"):
+    st.caption("R·F·M을 1~5점으로 나눌 때 같은 값의 고객은 항상 같은 점수를 받아요. 그래서 동점이 많은 값"
+               "(예: 구매 횟수 5회)이 한 점수에 몰리면 각 점수의 인원이 20%에서 벗어날 수 있어요.")
+    wide = {}
+    for k in rc.SCORE_SOURCE:
+        t = score_tbl[score_tbl["점수"] == k].set_index("점")
+        wide[f"{k} 고객 수"] = [f"{n:,}명 ({r:.1%})" for n, r in zip(t["고객 수"], t["비율"])]
+        wide[f"{k} 원래 값"] = t["원래 값 범위"].tolist()
+    st.dataframe(pd.DataFrame(wide, index=pd.Index([f"{p}점" for p in range(1, 6)], name="점수")), width="stretch")
+    st.caption(f"같은 원래 값인데 점수가 다른 고객: R {ties['R']}명 · F {ties['F']}명 · M {ties['M']}명")
+
 # ------------------------------------------------------------------ 5. 결과
 st.header("5. 세그먼트 결과")
 total_m = scored["monetary"].sum()
@@ -503,7 +517,13 @@ if kind.startswith("고객"):
 logs["세그먼트 기준"] = [
     f"분석 목표: {preset} (F:M = {wf:g}:{wm:g})",
     f"균형(1:1) 대비 세그먼트가 바뀐 고객: {sens['changed']:,}명",
-    "점수: R·F·M을 순위 기준 5등분해 1~5점 (R은 최근일수록 높음)",
+    "점수: R·F·M을 값 기준으로 5구간으로 나눠 1~5점 (R은 최근일수록 높음). 같은 값은 같은 점수 "
+    "(동점 고객의 평균 순위로 구간을 정함)",
+    "점수별 고객 수 — " + " / ".join(
+        f"{k}: " + ", ".join(f"{int(r['점'])}점 {r['고객 수']:,}명({r['비율']:.1%})"
+                            for _, r in score_tbl[score_tbl['점수'] == k].iterrows())
+        for k in rc.SCORE_SOURCE),
+    f"같은 원래 값인데 점수가 다른 고객: R {ties['R']}명, F {ties['F']}명, M {ties['M']}명",
     "가치 점수 V = (wF×F + wM×M) / (wF + wM)",
     "규칙: " + " / ".join(f"{k}: {v}" for k, v in rc.SEGMENT_RULES.items() if k != "일반") + " / 일반: 나머지",
 ]

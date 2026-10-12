@@ -190,24 +190,54 @@ PRESETS = {
 BASE_WEIGHTS = PRESETS["균형"]["weights"]
 
 
+def value_score(s: pd.Series, bins: int = 5, ascending: bool = True) -> pd.Series:
+    """값을 1~bins점으로 바꾼다. 같은 값이면 반드시 같은 점수.
+
+    동점인 고객들은 평균 순위(백분위)를 함께 쓰고, 그 백분위가 속한 구간의 점수를 받는다.
+    그래서 구간 경계는 서로 다른 값 사이에서만 생기고, 각 점수의 인원은 정확히 20%가 아닐 수 있다.
+    (예전 방식은 rank(method="first")로 동점자를 데이터 순서대로 잘라 같은 값이 다른 점수를 받았다)
+    ascending=False면 값이 작을수록 높은 점수 (R: 최근일수록 높음).
+    """
+    pct = s.rank(method="average", ascending=ascending, pct=True)
+    return np.ceil(pct * bins).clip(1, bins).astype(int)
+
+
 def score(rfm: pd.DataFrame, weights=BASE_WEIGHTS, bins: int = 5) -> pd.DataFrame:
     """R·F·M을 1~bins점으로 점수화하고, 가치 점수 V와 세그먼트를 붙인다.
 
-    동점이 많아도 구간이 고르게 나뉘도록 순위 기준으로 자른다.
-    R은 최근일수록(값이 작을수록) 높은 점수.
+    R은 최근일수록(값이 작을수록) 높은 점수. 같은 값은 같은 점수(value_score 참고).
     weights는 (wF, wM) 두 개. 합이 0이면 1:1로 본다.
     """
     r = rfm.copy()
-    labels = list(range(1, bins + 1))
-    r["R"] = pd.qcut(r["recency"].rank(method="first", ascending=False), bins, labels=labels).astype(int)
-    r["F"] = pd.qcut(r["frequency"].rank(method="first"), bins, labels=labels).astype(int)
-    r["M"] = pd.qcut(r["monetary"].rank(method="first"), bins, labels=labels).astype(int)
+    r["R"] = value_score(r["recency"], bins, ascending=False)
+    r["F"] = value_score(r["frequency"], bins)
+    r["M"] = value_score(r["monetary"], bins)
     wf, wm = (float(x) for x in weights)
     if wf + wm <= 0:
         wf, wm = BASE_WEIGHTS
     r["V"] = ((wf * r["F"] + wm * r["M"]) / (wf + wm)).round(2)
     r["segment"] = segment_rules(r["R"], r["V"], bins)
     return r
+
+
+SCORE_SOURCE = {"R": "recency", "F": "frequency", "M": "monetary"}
+
+
+def score_table(scored: pd.DataFrame, bins: int = 5) -> pd.DataFrame:
+    """점수별 고객 수와 그 점수에 해당하는 원래 값 범위. 구간이 고르게 나뉘었는지 확인용."""
+    rows = []
+    for k, raw in SCORE_SOURCE.items():
+        g = scored.groupby(k)[raw]
+        for p in range(1, bins + 1):
+            n = int((scored[k] == p).sum())
+            rng = f"{g.min()[p]:,.0f} ~ {g.max()[p]:,.0f}" if n else "-"
+            rows.append({"점수": k, "점": p, "고객 수": n, "비율": n / len(scored), "원래 값 범위": rng})
+    return pd.DataFrame(rows)
+
+
+def tie_conflicts(scored: pd.DataFrame) -> dict:
+    """같은 원래 값인데 점수가 다른 고객 수. 0이어야 정상."""
+    return {k: int((scored.groupby(raw)[k].transform("nunique") > 1).sum()) for k, raw in SCORE_SOURCE.items()}
 
 
 SEGMENT_INFO = {
