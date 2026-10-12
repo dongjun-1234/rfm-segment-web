@@ -3,10 +3,13 @@
 CSV를 올리면 → 데이터 품질 점검 → 컬럼 지정 → R·F·M 가중치 조절 → 세그먼트 결과
 실행: streamlit run app.py
 """
+import datetime as dt
 import os
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 import rfm_core as rc
@@ -16,6 +19,45 @@ st.set_page_config(page_title="RFM 세그먼트 분석기", page_icon="📊", la
 SEG_ORDER = ["VIP", "충성 고객", "이탈 위험 우수고객", "잠재 성장", "일반", "휴면"]
 SEG_COLOR = {"VIP": "#2E5BBA", "충성 고객": "#4C9BE8", "이탈 위험 우수고객": "#E8833A",
              "잠재 성장": "#59A96A", "일반": "#A0A4AB", "휴면": "#6B6F76"}
+UP, DOWN = "#2E5BBA", "#E8833A"   # 전체보다 높음(파랑) / 낮음(주황)
+HOVER_TIP = "막대 위에 마우스를 올리면 정확한 수치를 볼 수 있어요. (모바일은 막대를 눌러 주세요)"
+STAT_NAME = {"age": "평균 나이", "median": "중앙값", "mean": "평균", "rate": "참여율", "share": "전체 구매 중 비중"}
+
+
+# ------------------------------------------------------------------ 숫자 표시 형식 (천 단위 쉼표, 비율 소수 첫째 자리, 큰 금액 만 원)
+def fmt_money(v):
+    if pd.isna(v):
+        return "-"
+    return f"{v / 1e4:,.0f}만 원" if abs(v) >= 1e4 else f"{v:,.0f}원"
+
+
+def fmt_pct(x):
+    return "-" if pd.isna(x) else f"{x:.1%}"
+
+
+def fmt_signed(x):
+    if pd.isna(x):
+        return "-"
+    return "0.0%" if abs(x) < 0.0005 else f"{x:+.1%}"
+
+
+def fmt_value(v, spec):
+    if pd.isna(v):
+        return "-"
+    k = spec["kind"]
+    if k == "age":
+        return f"{v:,.1f}세"
+    if k in ("rate", "share", "promo"):
+        return fmt_pct(v)
+    if spec.get("money"):
+        return fmt_money(v)
+    return f"{v:,.2f}" if abs(v) < 100 else f"{v:,.0f}"
+
+
+def chart_title(title):
+    """그래프 제목과 수치 확인 안내를 그래프 위에 표시한다."""
+    st.markdown(f"**{title}**")
+    st.caption(HOVER_TIP)
 
 st.title("📊 RFM 세그먼트 분석기")
 st.caption("고객 CSV를 올리면 데이터 점검부터 R·F·M 가중치에 따른 고객 세그먼트까지 한 번에 보여줍니다.")
@@ -243,25 +285,129 @@ fig3 = px.density_heatmap(scored, x="R", y="F", z="monetary", histfunc="avg", nb
 st.plotly_chart(fig3, width="stretch")
 
 # 고객 합산형이면 세그먼트별로 다른 특성(소득, 자녀 수 등)도 비교
+small_cols, prof_methods, ref_year = [], {}, None
 if kind.startswith("고객"):
-    extra = [c for c in df.select_dtypes("number").columns
-             if c not in ([rec_col] + freq_cols + money_cols) and c != id_col]
-    if extra:
+    seg = scored["segment"]
+    dfp = df.loc[scored.index]
+    order = [s for s in SEG_ORDER if s in seg.unique()]
+    specs, skipped = rc.profile_specs(dfp, used_cols, freq_cols)
+    heavy = set(other_na.loc[other_na["처리"].str.startswith("특성"), "컬럼"]) if len(other_na) else set()
+    items = {}
+    for sp in specs:
+        if sp.get("promo"):
+            continue
+        items[f"나이 ({sp['col']})" if sp["kind"] == "age" else str(sp["col"])] = sp
+    promo_cols = [sp["col"] for sp in specs if sp.get("promo")]
+    if promo_cols:
+        items[f"프로모션 참여 ({len(promo_cols)}개 컬럼)"] = {"kind": "promo", "cols": promo_cols, "col": promo_cols[0]}
+
+    if items:
         st.subheader("세그먼트별 고객 특성")
-        pick = st.selectbox("비교할 컬럼", extra)
-        prof = df[[pick]].join(scored["segment"]).groupby("segment")[pick].mean() \
-            .reindex([s for s in SEG_ORDER if s in scored["segment"].unique()]).reset_index()
-        fig4 = px.bar(prof, x="segment", y=pick, color="segment", color_discrete_map=SEG_COLOR,
-                      title=f"세그먼트별 평균 {pick}")
-        fig4.update_layout(showlegend=False, xaxis_title=None)
-        st.plotly_chart(fig4, width="stretch")
-        if money_cols and len(money_cols) > 1:
-            mix = df[money_cols].join(scored["segment"]).groupby("segment")[money_cols].sum()
-            mix = mix.div(mix.sum(axis=1), axis=0).reindex(summary.index)
-            fig5 = px.bar(mix.reset_index().melt(id_vars="segment", var_name="품목", value_name="비중"),
-                          x="segment", y="비중", color="품목", title="세그먼트별 품목 구매 구성")
-            fig5.update_layout(yaxis_tickformat=".0%", xaxis_title=None)
-            st.plotly_chart(fig5, width="stretch")
+        st.caption("각 세그먼트가 전체 고객보다 몇 % 높고 낮은지 보여줘요. 빈 값은 이 비교에서만 빼고 계산합니다.")
+        if any(sp["kind"] == "age" for sp in items.values()):
+            ref_year = st.number_input("나이 계산 기준 연도", 1950, 2100, dt.date.today().year, key="ref_year",
+                                       help="출생연도를 나이로 바꿀 때 쓰는 연도예요. 실습 데이터는 2023년 기준이라 바꿀 수 있어요.")
+        default = [k for k, sp in items.items() if not set(sp.get("cols", [sp["col"]])) & heavy]
+        chosen = st.multiselect("비교할 컬럼", list(items), default=default, key="prof_cols",
+                                help="결측이 20% 이상인 컬럼은 기본으로 빠져 있어요. 필요하면 다시 고를 수 있어요.")
+
+        # 컬럼별 세그먼트 값 계산
+        vals = {}
+        for k in chosen:
+            sp = items[k]
+            if sp["kind"] == "category":
+                prof_methods[k] = "구성 비율"
+                continue
+            if sp["kind"] == "promo":
+                pr = rc.promo_rates(dfp, seg, sp["cols"], order)
+                v = pd.DataFrame({"value": pr["하나라도 참여"].drop("전체")})
+                v["diff"] = v["value"] / pr.loc["전체", "하나라도 참여"] - 1
+                v["n"] = seg.value_counts().reindex(v.index)
+                v.attrs["overall"] = pr.loc["전체", "하나라도 참여"]
+                prof_methods[k] = "참여율 (하나라도 참여)"
+            else:
+                v = rc.profile_values(dfp, seg, sp, ref_year, scored["frequency"], order)
+                prof_methods[k] = STAT_NAME[sp["kind"]]
+            vals[k] = v
+            if v["diff"].abs().max() < rc.SMALL_DIFF:
+                small_cols.append(k)
+
+        if vals:
+            st.markdown("**한눈에 보기: 세그먼트 × 컬럼 (전체 대비 차이)**")
+            st.caption("파랑은 전체보다 높음, 주황은 낮음. 차이가 클수록 진하게 칠했어요.")
+            table = pd.DataFrame({k: v["diff"] for k, v in vals.items()}).reindex(order)
+            table.index.name = "세그먼트"
+
+            def _cell(x):
+                # 흰색과 기준색을 섞은 불투명 색. 차이가 클수록(50%에서 최대) 기준색에 가깝게.
+                if pd.isna(x):
+                    return ""
+                a = 0.12 + 0.88 * min(abs(x) / 0.5, 1.0)
+                base = (46, 91, 186) if x > 0 else (232, 131, 58)
+                r, g, b = (round(255 + (c - 255) * a) for c in base)
+                return f"background-color: rgb({r},{g},{b}); color: {'#FFFFFF' if a > 0.55 else '#1F2430'}"
+
+            st.dataframe(table.style.map(_cell).format(fmt_signed), width="stretch")
+
+        if chosen:
+            pick = st.selectbox("자세히 볼 컬럼", chosen, key="prof_pick")
+            sp = items[pick]
+            if sp["kind"] == "category":
+                mix = rc.category_mix(dfp, seg, sp["col"], order)
+                cnt = pd.crosstab(seg.reindex(dfp[sp["col"]].dropna().index), dfp[sp["col"]].dropna()).reindex(mix.index)
+                long = mix.reset_index().melt(id_vars="segment", var_name="값", value_name="비율")
+                long["고객 수"] = [f"{cnt.loc[r.segment, r.값]:,}" for r in long.itertuples()]
+                long["비율 표시"] = long["비율"].map(fmt_pct)
+                chart_title(f"세그먼트별 {pick} 구성")
+                fig = px.bar(long, x="segment", y="비율", color="값", custom_data=["값", "비율 표시", "고객 수"])
+                fig.update_traces(hovertemplate="세그먼트: %{x}<br>값: %{customdata[0]}<br>"
+                                                "비율: %{customdata[1]}<br>고객 수: %{customdata[2]}명<extra></extra>")
+                fig.update_layout(yaxis_tickformat=".0%", xaxis_title=None, yaxis_title=None, legend_title=pick)
+                st.plotly_chart(fig, width="stretch")
+            elif sp["kind"] == "promo":
+                pr = rc.promo_rates(dfp, seg, sp["cols"], order)
+                long = pr.reset_index(names="segment").melt(id_vars="segment", var_name="프로모션", value_name="참여율")
+                long["참여율 표시"] = long["참여율"].map(fmt_pct)
+                n_seg = seg.value_counts()
+                long["고객 수"] = [f"{(n_seg.get(x) or len(seg)):,}" for x in long["segment"]]
+                chart_title("세그먼트별 프로모션 참여율")
+                fig = px.bar(long, x="segment", y="참여율", color="프로모션", barmode="group",
+                             custom_data=["프로모션", "참여율 표시", "고객 수"])
+                fig.update_traces(hovertemplate="세그먼트: %{x}<br>프로모션: %{customdata[0]}<br>"
+                                                "참여율: %{customdata[1]}<br>고객 수: %{customdata[2]}명<extra></extra>")
+                fig.update_layout(yaxis_tickformat=".0%", xaxis_title=None, yaxis_title=None)
+                st.plotly_chart(fig, width="stretch")
+                st.caption(f"'하나라도 참여'는 {len(sp['cols'])}개 프로모션 중 하나 이상 참여한 고객 비율이에요.")
+            else:
+                v = vals[pick]
+                mx = v["diff"].abs().max()
+                if mx < rc.SMALL_DIFF:
+                    st.info(f"`{pick}`은 세그먼트 간 차이가 거의 없어요 (최대 ±{mx:.1%}). "
+                            f"전체 {STAT_NAME[sp['kind']]}: {fmt_value(v.attrs['overall'], sp)}")
+                else:
+                    chart_title(f"세그먼트별 {pick} — 전체 대비 차이 ({STAT_NAME[sp['kind']]} 기준)")
+                    cd = np.stack([[fmt_value(x, sp) for x in v["value"]], [fmt_signed(x) for x in v["diff"]],
+                                   [f"{int(x):,}" for x in v["n"]]], axis=-1)
+                    fig = go.Figure(go.Bar(
+                        x=v.index, y=v["diff"], customdata=cd,
+                        marker_color=[UP if x >= 0 else DOWN for x in v["diff"]],
+                        text=[fmt_signed(x) for x in v["diff"]], textposition="outside", cliponaxis=False,
+                        hovertemplate="세그먼트: %{x}<br>" + STAT_NAME[sp["kind"]] + ": %{customdata[0]}<br>"
+                                      "전체 대비: %{customdata[1]}<br>고객 수: %{customdata[2]}명<extra></extra>"))
+                    fig.add_hline(y=0, line_color="#888", line_width=1)
+                    fig.update_layout(yaxis_tickformat="+.0%", yaxis_title="전체 대비 차이", xaxis_title=None,
+                                      margin=dict(t=30))
+                    st.plotly_chart(fig, width="stretch")
+                    st.caption(f"0선 = 전체 고객 {STAT_NAME[sp['kind']]} {fmt_value(v.attrs['overall'], sp)}. "
+                               "위로 가면 전체보다 높고, 아래로 가면 낮아요.")
+
+    if money_cols and len(money_cols) > 1:
+        mix = df.loc[scored.index, money_cols].join(scored["segment"]).groupby("segment")[money_cols].sum()
+        mix = mix.div(mix.sum(axis=1), axis=0).reindex(summary.index)
+        fig5 = px.bar(mix.reset_index().melt(id_vars="segment", var_name="품목", value_name="비중"),
+                      x="segment", y="비중", color="품목", title="세그먼트별 품목 구매 구성")
+        fig5.update_layout(yaxis_tickformat=".0%", xaxis_title=None)
+        st.plotly_chart(fig5, width="stretch")
 
 # ------------------------------------------------------------------ 6. 처리 기록과 내려받기
 st.header("6. 처리 기록")

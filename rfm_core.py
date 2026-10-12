@@ -252,3 +252,114 @@ def weight_sensitivity(rfm: pd.DataFrame, weights, base=BASE_WEIGHTS) -> dict:
                            "현재": a["segment"].value_counts()}).fillna(0).astype(int)
     counts["차이"] = counts["현재"] - counts["균형 (1:1)"]
     return {"changed": int((a["segment"] != b["segment"]).sum()), "counts": counts}
+
+
+# ---------------------------------------------------------------- 세그먼트별 특성 비교
+#
+# 세그먼트 값을 '전체 고객 값 대비 몇 % 높고 낮은지'로 바꿔 차이가 눈에 보이게 한다.
+# 컬럼 종류에 따라 계산 방식을 다르게 한다.
+#   age      출생연도 → 나이로 바꿔 평균
+#   median   소득·금액처럼 한쪽으로 치우친 값 → 중앙값
+#   mean     그 밖의 숫자 → 평균
+#   rate     0/1 컬럼 → 참여율
+#   share    빈도 계산에서 뺀 횟수 컬럼(할인 구매 등) → 전체 구매 중 비중
+#   category 문자열 범주 → 세그먼트별 구성 비율
+
+_BIRTH = re.compile(r"birth|year|출생|생년", re.I)
+_MONEY = re.compile(r"income|salary|amount|amt|mnt|spend|sales|금액|소득|매출", re.I)
+_DATE_LIKE = re.compile(r"(^|_)(ym|ymd|yyyymm|date|dt)$|date|signup|join|가입|연월|일자|_at$", re.I)
+_PROMO = re.compile(r"promo|campaign|accepted|프로모션|캠페인", re.I)
+SMALL_DIFF = 0.05   # 세그먼트 간 최대 차이가 5% 미만이면 그래프 대신 문장으로
+
+
+def profile_specs(df: pd.DataFrame, used_cols, freq_cols) -> tuple[list[dict], list[dict]]:
+    """비교할 컬럼과 계산 방식을 정한다. (비교 목록, 제외 목록[이유 포함])"""
+    specs, skipped = [], []
+    id_pat = re.compile("|".join(_HINTS["customer_id"]), re.I)
+    freq_pat = re.compile("|".join(_HINTS["frequency"]), re.I)
+    for c in df.columns:
+        if c in used_cols:
+            continue
+        s = df[c].dropna()
+        name = str(c)
+        if s.nunique() <= 1:
+            skipped.append({"col": c, "reason": "값이 하나뿐"})
+            continue
+        if not pd.api.types.is_numeric_dtype(s):
+            if s.nunique() <= 12:
+                specs.append({"col": c, "kind": "category"})
+            else:
+                skipped.append({"col": c, "reason": "범주가 너무 많음 (ID·날짜성)"})
+            continue
+        if id_pat.search(name) or (s.nunique() == len(s) and len(s) > 50 and (s % 1 == 0).all()):
+            skipped.append({"col": c, "reason": "ID성 컬럼"})
+            continue
+        if _DATE_LIKE.search(name) and not _BIRTH.search(name):
+            skipped.append({"col": c, "reason": "날짜성 컬럼"})
+            continue
+        if set(s.unique()) <= {0, 1}:
+            specs.append({"col": c, "kind": "rate", "promo": bool(_PROMO.search(name))})
+        elif _BIRTH.search(name) and s.between(1900, 2010).mean() > 0.95:
+            specs.append({"col": c, "kind": "age"})
+        elif freq_pat.search(name) and freq_cols:
+            specs.append({"col": c, "kind": "share"})
+        elif _MONEY.search(name) or (s.nunique() > 10 and s.skew() > 1):
+            specs.append({"col": c, "kind": "median", "money": bool(_MONEY.search(name))})
+        else:
+            specs.append({"col": c, "kind": "mean"})
+    return specs, skipped
+
+
+def _stat(x: pd.DataFrame, spec, ref_year):
+    c, k = spec["col"], spec["kind"]
+    if k == "age":
+        return (ref_year - x[c]).mean()
+    if k == "median":
+        return x[c].median()
+    if k == "share":
+        sub = x[[c, "_freq"]].dropna()
+        return sub[c].sum() / sub["_freq"].sum() if sub["_freq"].sum() else np.nan
+    return x[c].mean()   # mean, rate
+
+
+def profile_values(df: pd.DataFrame, segment: pd.Series, spec: dict, ref_year=None,
+                   frequency: pd.Series | None = None, order=None) -> pd.DataFrame:
+    """세그먼트별 값, 전체 값, 전체 대비 차이(비율), 값이 있는 고객 수."""
+    c = spec["col"]
+    x = df[[c]].copy()
+    if frequency is not None:
+        x["_freq"] = frequency
+    x = x[x[c].notna()]   # 결측은 특성 비교에서만 뺀다
+    seg = segment.reindex(x.index)
+    overall = _stat(x, spec, ref_year)
+    rows = []
+    for name, g in x.groupby(seg):
+        v = _stat(g, spec, ref_year)
+        rows.append({"segment": name, "value": v, "n": len(g),
+                     "diff": v / overall - 1 if overall else np.nan})
+    out = pd.DataFrame(rows).set_index("segment")
+    if order is not None:
+        out = out.reindex([s for s in order if s in out.index])
+    out.attrs["overall"] = overall
+    out.attrs["n_total"] = len(x)
+    return out
+
+
+def promo_rates(df: pd.DataFrame, segment: pd.Series, cols, order=None) -> pd.DataFrame:
+    """프로모션(0/1) 컬럼별 참여율과 '하나라도 참여한 비율'."""
+    x = df[cols].copy()
+    x["하나라도 참여"] = (x.fillna(0).sum(axis=1) > 0).astype(int)
+    out = x.groupby(segment.reindex(x.index)).mean()
+    out.loc["전체"] = x.mean()
+    if order is not None:
+        out = out.reindex([s for s in order if s in out.index] + ["전체"])
+    return out
+
+
+def category_mix(df: pd.DataFrame, segment: pd.Series, col, order=None) -> pd.DataFrame:
+    """범주형 컬럼의 세그먼트별 구성 비율 (행 합 = 1)."""
+    x = df[col].dropna()
+    out = pd.crosstab(segment.reindex(x.index), x, normalize="index")
+    if order is not None:
+        out = out.reindex([s for s in order if s in out.index])
+    return out
