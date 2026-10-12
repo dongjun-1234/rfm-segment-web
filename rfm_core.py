@@ -140,59 +140,80 @@ def rfm_from_transactions(df, id_col, date_col, invoice_col=None, amount_col=Non
 
 
 # ---------------------------------------------------------------- 점수화와 세그먼트
+#
+# 세그먼트는 두 축으로 나눈다.
+# - 상태 축: R 점수 (최근에 왔는가). 가중치를 주지 않는다.
+# - 가치 축: V = (wF×F + wM×M) / (wF + wM). 구매 횟수와 금액 점수의 가중 평균.
+# 가중치는 '가치 있는 고객'을 판단하는 기준이므로 가치 축(V)에만 쓴다.
+# R에 가중치를 주면 최근에 온 고객이 위로 올라올 뿐 이탈 고객을 찾는 데 도움이 되지 않는다.
 
-def score(rfm: pd.DataFrame, weights=(1.0, 1.0, 1.0), bins: int = 5) -> pd.DataFrame:
-    """R·F·M을 1~bins점으로 점수화하고 가중 점수를 계산한다.
+PRESETS = {
+    "균형": {"weights": (1.0, 1.0), "why": "구매 횟수와 금액을 똑같이 봐요"},
+    "재구매 중시": {"weights": (3.0, 1.0), "why": "자주 오는 고객을 더 중요하게 봐요"},
+    "매출 중시": {"weights": (1.0, 3.0), "why": "많이 쓰는 고객을 더 중요하게 봐요"},
+}
+BASE_WEIGHTS = PRESETS["균형"]["weights"]
+
+
+def score(rfm: pd.DataFrame, weights=BASE_WEIGHTS, bins: int = 5) -> pd.DataFrame:
+    """R·F·M을 1~bins점으로 점수화하고, 가치 점수 V와 세그먼트를 붙인다.
 
     동점이 많아도 구간이 고르게 나뉘도록 순위 기준으로 자른다.
     R은 최근일수록(값이 작을수록) 높은 점수.
+    weights는 (wF, wM) 두 개. 합이 0이면 1:1로 본다.
     """
     r = rfm.copy()
     labels = list(range(1, bins + 1))
     r["R"] = pd.qcut(r["recency"].rank(method="first", ascending=False), bins, labels=labels).astype(int)
     r["F"] = pd.qcut(r["frequency"].rank(method="first"), bins, labels=labels).astype(int)
     r["M"] = pd.qcut(r["monetary"].rank(method="first"), bins, labels=labels).astype(int)
-    w = np.array(weights, dtype=float)
-    w = w / w.sum() if w.sum() > 0 else np.ones(3) / 3
-    r["RFM_score"] = (r[["R", "F", "M"]].to_numpy() * w).sum(axis=1).round(2)
-    r["value_tier"] = pd.qcut(r["RFM_score"].rank(method="first", ascending=False), [0, .2, .5, .8, 1.0],
-                              labels=["상위 20%", "20~50%", "50~80%", "하위 20%"])
-    r["segment"] = segment_rules(r["R"], r["F"], r["M"], bins)
+    wf, wm = (float(x) for x in weights)
+    if wf + wm <= 0:
+        wf, wm = BASE_WEIGHTS
+    r["V"] = ((wf * r["F"] + wm * r["M"]) / (wf + wm)).round(2)
+    r["segment"] = segment_rules(r["R"], r["V"], bins)
     return r
 
 
 SEGMENT_INFO = {
-    "VIP": "최근에도 자주, 많이 사는 핵심 고객",
-    "충성 고객": "자주 사지만 금액이나 최근성은 VIP보다 조금 낮은 고객",
-    "이탈 위험 우수고객": "예전엔 자주·많이 샀지만 최근 발길이 끊긴 고객",
-    "잠재 성장": "최근에 왔지만 아직 구매가 적은 고객",
-    "휴면": "오래 안 왔고 구매도 적은 고객",
+    "VIP": "최근에도 오고, 가치(구매 횟수·금액)도 높은 핵심 고객",
+    "충성 고객": "가치가 높고 최근성은 중간인 고객",
+    "이탈 위험 우수고객": "가치가 높지만 최근 발길이 끊긴 고객",
+    "잠재 성장": "최근에 왔지만 아직 가치가 낮은 고객",
+    "휴면": "오래 안 왔고 가치도 낮은 고객",
     "일반": "어느 쪽에도 뚜렷하게 속하지 않는 고객",
 }
 
+SEGMENT_RULES = {
+    "VIP": "V ≥ 4 그리고 R ≥ 4",
+    "충성 고객": "V ≥ 4 그리고 R = 3",
+    "이탈 위험 우수고객": "V ≥ 4 그리고 R ≤ 2",
+    "잠재 성장": "V ≤ 2 그리고 R ≥ 4",
+    "휴면": "V ≤ 2 그리고 R ≤ 2",
+    "일반": "위에 해당하지 않음",
+}
 
-def segment_rules(R, F, M, bins=5) -> pd.Series:
+
+def segment_rules(R, V, bins=5) -> pd.Series:
+    """상태 축(R)과 가치 축(V)의 조합으로 세그먼트를 정한다."""
     hi = bins - 1   # 5점 척도에서 4점 이상
     lo = 2          # 2점 이하
-    FM = (F + M) / 2
     cond = [
-        (R >= hi) & (F >= hi) & (M >= hi),
-        (R >= 3) & (FM >= hi),
-        (R <= lo) & (FM >= hi),
-        (R >= hi) & (FM <= lo + 0.5),
-        (R <= lo) & (FM <= lo),
+        (V >= hi) & (R >= hi),
+        (V >= hi) & (R == 3),
+        (V >= hi) & (R <= lo),
+        (V <= lo) & (R >= hi),
+        (V <= lo) & (R <= lo),
     ]
     names = ["VIP", "충성 고객", "이탈 위험 우수고객", "잠재 성장", "휴면"]
     return pd.Series(np.select(cond, names, default="일반"), index=R.index)
 
 
-def weight_sensitivity(rfm: pd.DataFrame, weights, base=(1, 1, 1)) -> dict:
-    """선택한 가중치와 기준 가중치에서 '상위 20%' 고객이 얼마나 겹치는지 비교."""
+def weight_sensitivity(rfm: pd.DataFrame, weights, base=BASE_WEIGHTS) -> dict:
+    """균형(1:1) 대비 세그먼트가 바뀐 고객 수와 세그먼트별 고객 수를 비교한다."""
     a = score(rfm, weights)
     b = score(rfm, base)
-    top_a = set(a.loc[a["value_tier"] == "상위 20%", "customer_id"])
-    top_b = set(b.loc[b["value_tier"] == "상위 20%", "customer_id"])
-    inter = len(top_a & top_b)
-    return {"top_n": len(top_a), "overlap": inter,
-            "overlap_rate": inter / max(len(top_a), 1),
-            "new_in": len(top_a - top_b), "dropped_out": len(top_b - top_a)}
+    counts = pd.DataFrame({"균형 (1:1)": b["segment"].value_counts(),
+                           "현재": a["segment"].value_counts()}).fillna(0).astype(int)
+    counts["차이"] = counts["현재"] - counts["균형 (1:1)"]
+    return {"changed": int((a["segment"] != b["segment"]).sum()), "counts": counts}

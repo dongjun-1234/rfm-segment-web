@@ -149,23 +149,39 @@ if len(rfm) < 10:
     st.error("고객 수가 너무 적어 점수를 나눌 수 없습니다.")
     st.stop()
 
-# ------------------------------------------------------------------ 4. 가중치
-st.header("4. R·F·M 가중치")
-st.caption("사업 목표에 따라 중요도를 조절하세요. 예) 이탈 방지가 목표면 R↑, 객단가 관리가 목표면 M↑")
-a, b, c = st.columns(3)
-wr = a.slider("R 가중치", 0.0, 5.0, 1.0, 0.5)
-wf = b.slider("F 가중치", 0.0, 5.0, 1.0, 0.5)
-wm = c.slider("M 가중치", 0.0, 5.0, 1.0, 0.5)
-if wr + wf + wm == 0:
-    st.warning("가중치가 모두 0입니다. 하나 이상 올려 주세요.")
-    st.stop()
+# ------------------------------------------------------------------ 4. 세그먼트 기준 (가중치)
+st.header("4. 세그먼트 기준")
+st.markdown("최근성(R)은 고객의 **현재 상태**, 가중치는 **'가치 있는 고객'을 판단하는 기준**이에요. "
+            "가치 점수 V는 구매 횟수(F)와 금액(M) 점수를 아래 비율로 섞어 계산합니다.")
+preset_names = list(rc.PRESETS) + ["직접 조정"]
+preset = st.radio(
+    "분석 목표", preset_names, key="preset",
+    captions=[f"F:M = {w['weights'][0]:g}:{w['weights'][1]:g} — {w['why']}" for w in rc.PRESETS.values()]
+    + ["F·M 슬라이더로 비율을 직접 정해요"])
+st.caption("이 비율은 정답이 아니라 출발점이에요. 결과를 보면서 사업 목표에 맞게 바꿔 보세요.")
+if preset == "직접 조정":
+    a, b = st.columns(2)
+    wf = a.slider("F (구매 횟수) 가중치", 0.0, 5.0, 1.0, 0.5, key="wf")
+    wm = b.slider("M (구매 금액) 가중치", 0.0, 5.0, 1.0, 0.5, key="wm")
+    if wf + wm == 0:
+        st.warning("가중치가 모두 0입니다. 하나 이상 올려 주세요.")
+        st.stop()
+else:
+    wf, wm = rc.PRESETS[preset]["weights"]
+st.info("💡 이탈 방지가 목적이라면 가중치를 바꾸기보다 결과의 **'이탈 위험 우수고객'** 세그먼트를 보세요. "
+        "가치는 높은데 최근 발길이 끊긴 고객들입니다.")
 
-scored = rc.score(rfm, (wr, wf, wm))
-sens = rc.weight_sensitivity(rfm, (wr, wf, wm))
-if (wr, wf, wm) != (1.0, 1.0, 1.0):
-    st.info(f"가중치를 같게 뒀을 때와 비교하면, 상위 20% 고객 {sens['top_n']:,}명 중 "
-            f"**{sens['new_in']:,}명이 바뀌었습니다** (겹치는 비율 {sens['overlap_rate']:.0%}). "
-            "가중치 선택이 '누구를 핵심 고객으로 볼지'를 바꾼다는 뜻입니다.")
+scored = rc.score(rfm, (wf, wm))
+sens = rc.weight_sensitivity(rfm, (wf, wm))
+if sens["changed"]:
+    st.markdown(f"**균형(1:1) 대비 {sens['changed']:,}명의 세그먼트가 바뀌었습니다.**")
+    cnt = sens["counts"].reindex([s for s in SEG_ORDER if s in sens["counts"].index])
+    st.dataframe(cnt.style.format("{:+,}", subset=["차이"]).format("{:,}", subset=["균형 (1:1)", "현재"]),
+                 width="content")
+else:
+    st.caption("균형(1:1)과 세그먼트 결과가 같습니다.")
+with st.expander("세그먼트 규칙 보기"):
+    st.markdown("\n".join(f"- **{k}**: {v}" for k, v in rc.SEGMENT_RULES.items()))
 
 # ------------------------------------------------------------------ 5. 결과
 st.header("5. 세그먼트 결과")
@@ -228,7 +244,7 @@ st.header("6. 처리 기록")
 st.caption("어떤 판단으로 데이터를 다뤘는지 남겨 두면 결과를 다시 검증할 수 있습니다.")
 for n in notes:
     st.markdown(f"- {n}")
-st.markdown(f"- 가중치 R:F:M = {wr:g}:{wf:g}:{wm:g}, 점수는 1~5점 (순위 기준 5등분)")
+st.markdown(f"- 세그먼트 기준: {preset} (F:M = {wf:g}:{wm:g}), 점수는 1~5점 (순위 기준 5등분)")
 
 st.download_button("세그먼트 결과 CSV 내려받기",
                    scored.to_csv(index=False).encode("utf-8-sig"),
