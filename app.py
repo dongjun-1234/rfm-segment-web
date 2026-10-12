@@ -4,6 +4,7 @@ CSV를 올리면 → 데이터 품질 점검 → 컬럼 지정 → R·F·M 가�
 실행: streamlit run app.py
 """
 import datetime as dt
+import hashlib
 import os
 
 import numpy as np
@@ -98,7 +99,11 @@ def load(raw: bytes) -> pd.DataFrame:
     return rc.read_csv_auto(raw)
 
 
-df_raw = load(up.getvalue() if up is not None else open(dev_file, "rb").read())
+raw = up.getvalue() if up is not None else open(dev_file, "rb").read()
+df_raw = load(raw)
+# 파일마다 다른 값. 위젯 key에 붙여서 새 파일을 올리면 선택칸이 새로 만들어지고 자동 추측값이 다시 적용되게 한다.
+# (key가 없으면 컬럼 구성이 같은 파일을 올렸을 때 이전 파일에서 고른 값이 그대로 남는다)
+file_sig = hashlib.md5(raw).hexdigest()[:10]
 file_name = up.name if up is not None else os.path.basename(dev_file)
 # 처리 기록: 화면에서 내린 판단을 소제목별로 모은다 (6. 처리 기록에서 보여주고 .md로 내려받기)
 logs = {"데이터": [f"파일 이름: {file_name}", f"원래 크기: {df_raw.shape[0]:,}행 × {df_raw.shape[1]}열",
@@ -137,7 +142,7 @@ if q["constant"]:
     logs["데이터 정리"].append(f"제외한 컬럼 (값이 하나뿐): {', '.join(map(str, q['constant']))}")
 
 if q["duplicated_rows"]:
-    if st.checkbox(f"완전히 같은 중복 행 {q['duplicated_rows']}개 제거", value=True):
+    if st.checkbox(f"완전히 같은 중복 행 {q['duplicated_rows']}개 제거", value=True, key=f"dup_{file_sig}"):
         df = df.drop_duplicates()
         n_dup = q["duplicated_rows"]
 
@@ -148,32 +153,41 @@ if q["outliers"]:
     ot = pd.DataFrame(q["outliers"]).T[["count", "min", "max"]]
     ot.columns = ["극단값 개수", "최솟값", "최댓값"]
     st.dataframe(ot, width="stretch")
-    drop_out_cols = st.multiselect("극단값 행을 제외할 컬럼", [c for c in q["outliers"] if c in df.columns])
+    drop_out_cols = st.multiselect("극단값 행을 제외할 컬럼", [c for c in q["outliers"] if c in df.columns],
+                                   key=f"extreme_{file_sig}")
     if drop_out_cols:
         df, n_extreme = rc.drop_extreme(df, drop_out_cols)
 
 # ------------------------------------------------------------------ 3. 컬럼 지정
 st.header("3. R·F·M 컬럼 지정")
+st.caption("웹이 컬럼 이름을 보고 미리 골라 두었어요. 맞는지 확인하고, 다르면 직접 바꿔 주세요.")
 cols = list(df.columns)
 num_cols = list(df.select_dtypes("number").columns)
 
 
-def idx(options, value):
-    return options.index(value) if value in options else 0
+def pick(where, label, options, guess, role, help):
+    """자동 추측값을 기본으로 보여주는 선택칸. key에 파일 서명을 넣어 파일이 바뀌면 새로 만든다."""
+    index = options.index(guess) if guess in options else 0
+    return where.selectbox(label, options, index=index, key=f"{role}_{file_sig}", help=help)
 
 
 if kind.startswith("고객"):
-    a, b = st.columns(2)
     g_id, g_rec = rc.guess_columns(df, "customer_id"), rc.guess_columns(df, "recency")
-    id_col = a.selectbox("고객 ID", ["(행 번호 사용)"] + cols,
-                         index=idx(["(행 번호 사용)"] + cols, g_id))
-    rec_col = b.selectbox("최근성 (마지막 구매 후 경과일)", num_cols,
-                          index=idx(num_cols, g_rec))
-    f_guess = [c for c in rc.guess_columns(df, "frequency", True) if "discount" not in c.lower()]
+    f_guess = [c for c in rc.guess_columns(df, "frequency", True) if "discount" not in str(c).lower()]
     m_guess = rc.guess_columns(df, "monetary", True)
-    freq_cols = st.multiselect("빈도 (더할 구매 횟수 컬럼)", num_cols, default=f_guess,
-                               help="할인 구매처럼 다른 횟수와 겹칠 수 있는 컬럼은 이중 집계가 되지 않는지 확인하세요.")
-    money_cols = st.multiselect("금액 (더할 구매 금액 컬럼)", num_cols, default=m_guess)
+    a, b = st.columns(2)
+    id_col = pick(a, "CSV에서 고객 ID가 담긴 컬럼을 선택하세요", ["(행 번호 사용)"] + cols, g_id, "id",
+                  "고객 한 명을 구분하는 값이에요. 예) ID, Customer ID, 회원번호")
+    rec_col = pick(b, "CSV에서 마지막 구매 후 경과일이 담긴 컬럼을 선택하세요", num_cols, g_rec, "rec",
+                   "마지막으로 산 지 며칠 지났는지예요. 예) recency, 최근구매경과일. "
+                   "금액이나 횟수 컬럼을 고르면 결과가 틀어져요.")
+    freq_cols = st.multiselect("구매 횟수가 담긴 컬럼을 모두 선택하세요 (선택한 값을 더해요)", num_cols,
+                               default=f_guess, key=f"freq_{file_sig}",
+                               help="예) 웹 구매 횟수 + 매장 구매 횟수. 할인 구매처럼 다른 횟수와 겹치는 컬럼은 "
+                                    "빼야 두 번 세지 않아요.")
+    money_cols = st.multiselect("구매 금액이 담긴 컬럼을 모두 선택하세요 (선택한 값을 더해요)", num_cols,
+                                default=m_guess, key=f"money_{file_sig}",
+                                help="예) 품목별 구매 금액을 모두 선택하면 고객의 총 구매 금액이 돼요.")
     if not (freq_cols and money_cols):
         st.warning("빈도와 금액 컬럼을 하나 이상 골라 주세요.")
         st.stop()
@@ -183,24 +197,32 @@ if kind.startswith("고객"):
     col_log = [("고객 ID", id_col, g_id or "(행 번호 사용)"), ("최근성", rec_col, g_rec),
                ("빈도", freq_cols, f_guess), ("금액", money_cols, m_guess)]
 else:
-    a, b, c = st.columns(3)
     g_id, g_date, g_inv = (rc.guess_columns(df, r) for r in ("customer_id", "date", "invoice"))
-    id_col = a.selectbox("고객 ID", cols, index=idx(cols, g_id))
-    date_col = b.selectbox("거래 일시", cols, index=idx(cols, g_date))
-    inv_col = c.selectbox("주문 번호 (없으면 날짜로 횟수 계산)", ["(없음)"] + cols,
-                          index=idx(["(없음)"] + cols, g_inv))
-    mode = st.radio("금액 계산", ["금액 컬럼 사용", "수량 × 단가"], horizontal=True,
-                    index=1 if rc.guess_columns(df, "quantity") else 0)
+    a, b, c = st.columns(3)
+    id_col = pick(a, "CSV에서 고객 ID가 담긴 컬럼을 선택하세요", cols, g_id, "tid",
+                  "고객 한 명을 구분하는 값이에요. 예) Customer ID, 회원번호. 거래형은 같은 고객이 여러 줄에 나와도 괜찮아요.")
+    date_col = pick(b, "CSV에서 거래 일시가 담긴 컬럼을 선택하세요", cols, g_date, "date",
+                    "언제 샀는지예요. 예) InvoiceDate, 주문일시. 고객별 마지막 거래일로 최근성을 계산해요.")
+    inv_col = pick(c, "CSV에서 주문 번호가 담긴 컬럼을 선택하세요", ["(없음)"] + cols, g_inv, "inv",
+                   "주문 한 건을 구분하는 값이에요. 예) Invoice, 주문번호. 없으면 '(없음)'을 고르면 "
+                   "거래한 날짜 수로 구매 횟수를 세요.")
+    mode = st.radio("구매 금액을 어떻게 계산할지 선택하세요", ["금액 컬럼 사용", "수량 × 단가"], horizontal=True,
+                    index=1 if rc.guess_columns(df, "quantity") else 0, key=f"mode_{file_sig}",
+                    help="거래 한 건의 금액 컬럼이 있으면 그대로 쓰고, 없으면 수량과 단가를 곱해요.")
     if mode == "금액 컬럼 사용":
-        amt_col = st.selectbox("금액", num_cols, index=idx(num_cols, rc.guess_columns(df, "monetary")))
+        amt_col = pick(st, "CSV에서 거래 금액이 담긴 컬럼을 선택하세요", num_cols,
+                       rc.guess_columns(df, "monetary"), "amt",
+                       "거래 한 건의 금액이에요. 예) Amount, 결제금액. 고객별로 더하면 총 구매 금액이 돼요.")
         qty_col = price_col = None
     else:
         a, b = st.columns(2)
-        qty_col = a.selectbox("수량", num_cols, index=idx(num_cols, rc.guess_columns(df, "quantity")))
-        price_col = b.selectbox("단가", num_cols, index=idx(num_cols, rc.guess_columns(df, "price")))
+        qty_col = pick(a, "CSV에서 수량이 담긴 컬럼을 선택하세요", num_cols, rc.guess_columns(df, "quantity"), "qty",
+                       "한 번에 몇 개 샀는지예요. 예) Quantity, 수량. 수량 × 단가로 거래 금액을 계산해요.")
+        price_col = pick(b, "CSV에서 단가가 담긴 컬럼을 선택하세요", num_cols, rc.guess_columns(df, "price"), "price",
+                         "상품 하나의 가격이에요. 예) Price, UnitPrice, 단가")
         amt_col = None
-    ref = st.date_input("분석 기준일 (비우면 마지막 거래 다음 날)", value=None)
-    drop_neg = st.checkbox("금액이 0 이하인 거래(취소·반품) 제외", value=True)
+    ref = st.date_input("분석 기준일 (비우면 마지막 거래 다음 날)", value=None, key=f"ref_{file_sig}")
+    drop_neg = st.checkbox("금액이 0 이하인 거래(취소·반품) 제외", value=True, key=f"neg_{file_sig}")
     rfm, log = rc.rfm_from_transactions(df, id_col, date_col,
                                         None if inv_col == "(없음)" else inv_col,
                                         amt_col, qty_col, price_col, ref, drop_neg)
@@ -370,7 +392,7 @@ if kind.startswith("고객"):
             ref_year = st.number_input("나이 계산 기준 연도", 1950, 2100, dt.date.today().year, key="ref_year",
                                        help="출생연도를 나이로 바꿀 때 쓰는 연도예요. 실습 데이터는 2023년 기준이라 바꿀 수 있어요.")
         default = [k for k, sp in items.items() if not set(sp.get("cols", [sp["col"]])) & heavy]
-        chosen = st.multiselect("비교할 컬럼", list(items), default=default, key="prof_cols",
+        chosen = st.multiselect("비교할 컬럼", list(items), default=default, key=f"prof_cols_{file_sig}",
                                 help="결측이 20% 이상인 컬럼은 기본으로 빠져 있어요. 필요하면 다시 고를 수 있어요.")
 
         # 컬럼별 세그먼트 값 계산
@@ -412,7 +434,7 @@ if kind.startswith("고객"):
             st.dataframe(table.style.map(_cell).format(fmt_signed), width="stretch")
 
         if chosen:
-            pick = st.selectbox("자세히 볼 컬럼", chosen, key="prof_pick")
+            pick = st.selectbox("자세히 볼 컬럼", chosen, key=f"prof_pick_{file_sig}")
             sp = items[pick]
             if sp["kind"] == "category":
                 mix = rc.category_mix(dfp, seg, sp["col"], order)
