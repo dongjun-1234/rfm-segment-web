@@ -54,6 +54,20 @@ def fmt_value(v, spec):
     return f"{v:,.2f}" if abs(v) < 100 else f"{v:,.0f}"
 
 
+ITEM_KO = {"alcohol": "주류", "wine": "주류", "fruit": "과일", "meat": "육류", "fish": "수산물",
+           "snack": "과자", "sweet": "과자", "general": "잡화", "gold": "잡화"}
+
+
+def item_name(col):
+    """amount_meat → 육류. 모르는 이름은 amount_만 떼고 그대로."""
+    key = str(col)
+    for pre in ("amount_", "amt_", "mnt_", "Mnt"):
+        if key.startswith(pre):
+            key = key[len(pre):]
+            break
+    return ITEM_KO.get(key.lower(), key)
+
+
 def chart_title(title):
     """그래프 제목과 수치 확인 안내를 그래프 위에 표시한다."""
     st.markdown(f"**{title}**")
@@ -259,29 +273,51 @@ summary = (scored.groupby("segment")
 summary["고객 비중"] = summary["고객수"] / summary["고객수"].sum()
 summary["매출 비중"] = summary["매출합"] / total_m
 
+# 고객 비중·매출 비중: 마우스를 올리면 두 값을 함께 보여준다
+sm = summary.reset_index()
+share_cd = np.stack([[f"{int(n):,}" for n in sm["고객수"]], sm["고객 비중"].map(fmt_pct),
+                     sm["매출 비중"].map(fmt_pct)], axis=-1)
+share_hover = ("세그먼트: %{x}<br>고객 수: %{customdata[0]}명 (%{customdata[1]})<br>"
+               "매출 비중: %{customdata[2]}<extra></extra>")
 a, b = st.columns(2)
-fig1 = px.bar(summary.reset_index(), x="segment", y="고객 비중", color="segment",
-              color_discrete_map=SEG_COLOR, title="세그먼트별 고객 비중", text_auto=".0%")
-fig2 = px.bar(summary.reset_index(), x="segment", y="매출 비중", color="segment",
-              color_discrete_map=SEG_COLOR, title="세그먼트별 매출 비중", text_auto=".0%")
-for f in (fig1, fig2):
-    f.update_layout(showlegend=False, xaxis_title=None, yaxis_tickformat=".0%")
-a.plotly_chart(fig1, width="stretch")
-b.plotly_chart(fig2, width="stretch")
+for col, ycol, title in ((a, "고객 비중", "세그먼트별 고객 비중"), (b, "매출 비중", "세그먼트별 매출 비중")):
+    with col:
+        chart_title(title)
+        f = go.Figure(go.Bar(x=sm["segment"], y=sm[ycol], customdata=share_cd, hovertemplate=share_hover,
+                             marker_color=[SEG_COLOR[x] for x in sm["segment"]],
+                             text=sm[ycol].map(fmt_pct), textposition="outside", cliponaxis=False))
+        f.update_layout(xaxis_title=None, yaxis_tickformat=".0%", margin=dict(t=20))
+        st.plotly_chart(f, width="stretch")
 
 top = summary.sort_values("매출 비중", ascending=False).iloc[0]
-st.markdown(f"**한눈에 보기:** `{summary['매출 비중'].idxmax()}` 고객이 전체의 {top['고객 비중']:.0%}로 "
-            f"매출의 {top['매출 비중']:.0%}를 차지합니다.")
+st.markdown(f"**한눈에 보기:** `{summary['매출 비중'].idxmax()}` 고객이 전체의 {fmt_pct(top['고객 비중'])}로 "
+            f"매출의 {fmt_pct(top['매출 비중'])}를 차지합니다.")
 
-show = summary.copy()
-show["고객 비중"] = show["고객 비중"].map("{:.1%}".format)
-show["매출 비중"] = show["매출 비중"].map("{:.1%}".format)
-show = show.drop(columns="매출합").round(1)
-show.insert(0, "설명", [rc.SEGMENT_INFO[s] for s in show.index])
+show = pd.DataFrame({
+    "설명": [rc.SEGMENT_INFO[x] for x in summary.index],
+    "고객 수": summary["고객수"].map("{:,}명".format),
+    "고객 비중": summary["고객 비중"].map(fmt_pct),
+    "매출 비중": summary["매출 비중"].map(fmt_pct),
+    "평균 경과일 (R)": summary["평균_R"].map("{:,.1f}일".format),
+    "평균 구매 횟수 (F)": summary["평균_F"].map("{:,.1f}회".format),
+    "평균 구매 금액 (M)": summary["평균_M"].map(fmt_money),
+}, index=summary.index.rename("세그먼트"))
 st.dataframe(show, width="stretch")
 
-fig3 = px.density_heatmap(scored, x="R", y="F", z="monetary", histfunc="avg", nbinsx=5, nbinsy=5,
-                          title="R·F 점수별 평균 구매 금액", color_continuous_scale="Blues")
+# R·F 히트맵: 칸마다 평균 구매 금액과 고객 수
+chart_title("R·F 점수별 평균 구매 금액")
+st.caption("오른쪽(R↑)일수록 최근에 온 고객, 위쪽(F↑)일수록 자주 산 고객이에요. 진할수록 평균 구매 금액이 커요.")
+rf = scored.groupby(["F", "R"])["monetary"].agg(["mean", "size"])
+z = rf["mean"].unstack("R").reindex(index=range(1, 6), columns=range(1, 6))
+n = rf["size"].unstack("R").reindex(index=range(1, 6), columns=range(1, 6)).fillna(0)
+cd = np.dstack([z.map(fmt_money).to_numpy(), n.map(lambda x: f"{int(x):,}").to_numpy()])
+fig3 = go.Figure(go.Heatmap(
+    z=z.to_numpy(), x=list(z.columns), y=list(z.index), customdata=cd, colorscale="Blues",
+    colorbar=dict(title="평균 금액"),
+    hovertemplate="R 점수: %{x}<br>F 점수: %{y}<br>평균 구매 금액: %{customdata[0]}<br>"
+                  "고객 수: %{customdata[1]}명<extra></extra>"))
+fig3.update_layout(xaxis_title="R 점수 (최근성)", yaxis_title="F 점수 (구매 횟수)", margin=dict(t=20),
+                   xaxis=dict(dtick=1), yaxis=dict(dtick=1))
 st.plotly_chart(fig3, width="stretch")
 
 # 고객 합산형이면 세그먼트별로 다른 특성(소득, 자녀 수 등)도 비교
@@ -402,11 +438,17 @@ if kind.startswith("고객"):
                                "위로 가면 전체보다 높고, 아래로 가면 낮아요.")
 
     if money_cols and len(money_cols) > 1:
-        mix = df.loc[scored.index, money_cols].join(scored["segment"]).groupby("segment")[money_cols].sum()
-        mix = mix.div(mix.sum(axis=1), axis=0).reindex(summary.index)
-        fig5 = px.bar(mix.reset_index().melt(id_vars="segment", var_name="품목", value_name="비중"),
-                      x="segment", y="비중", color="품목", title="세그먼트별 품목 구매 구성")
-        fig5.update_layout(yaxis_tickformat=".0%", xaxis_title=None)
+        sums = df.loc[scored.index, money_cols].groupby(scored["segment"]).sum().reindex(summary.index)
+        mix = sums.div(sums.sum(axis=1), axis=0)
+        long = mix.reset_index(names="segment").melt(id_vars="segment", var_name="col", value_name="비중")
+        long["금액 합계"] = [fmt_money(sums.loc[r.segment, r.col]) for r in long.itertuples()]
+        long["품목"] = long["col"].map(item_name)
+        long["비중 표시"] = long["비중"].map(fmt_pct)
+        chart_title("세그먼트별 품목 구매 구성")
+        fig5 = px.bar(long, x="segment", y="비중", color="품목", custom_data=["품목", "비중 표시", "금액 합계"])
+        fig5.update_traces(hovertemplate="세그먼트: %{x}<br>품목: %{customdata[0]}<br>비중: %{customdata[1]}<br>"
+                                         "금액 합계: %{customdata[2]}<extra></extra>")
+        fig5.update_layout(yaxis_tickformat=".0%", xaxis_title=None, yaxis_title=None, margin=dict(t=20))
         st.plotly_chart(fig5, width="stretch")
 
 # ------------------------------------------------------------------ 6. 처리 기록과 내려받기
