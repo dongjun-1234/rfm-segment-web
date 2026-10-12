@@ -100,13 +100,48 @@ def drop_extreme(df: pd.DataFrame, cols: list[str]) -> tuple[pd.DataFrame, int]:
 
 # ---------------------------------------------------------------- R·F·M 만들기
 
-def rfm_from_customer_table(df, id_col, recency_col, freq_cols, money_cols) -> pd.DataFrame:
+MISSING_WARN = 0.05      # RFM에 안 쓰는 컬럼: 5% 이상이면 해석 주의
+MISSING_EXCLUDE = 0.20   # 20% 이상이면 특성 비교에서 기본 제외 / RFM 제외 고객이 20% 이상이면 경고
+
+
+def rfm_from_customer_table(df, id_col, recency_col, freq_cols, money_cols) -> tuple[pd.DataFrame, dict]:
+    """고객 합산형 표에서 R·F·M을 만든다.
+
+    RFM에 쓰는 컬럼(고객 ID, 최근성, 빈도·금액 컬럼) 중 하나라도 비어 있는 고객은 제외한다.
+    여러 컬럼을 더할 때 빈 값을 0으로 보지 않도록 min_count로 '모두 있어야 합계'를 낸다.
+    """
     out = pd.DataFrame(index=df.index)
     out["customer_id"] = df[id_col] if id_col else df.index
     out["recency"] = df[recency_col]
-    out["frequency"] = df[freq_cols].sum(axis=1)
-    out["monetary"] = df[money_cols].sum(axis=1)
-    return out
+    out["frequency"] = df[freq_cols].sum(axis=1, min_count=len(freq_cols))
+    out["monetary"] = df[money_cols].sum(axis=1, min_count=len(money_cols))
+    used = ([id_col] if id_col else []) + [recency_col] + list(freq_cols) + list(money_cols)
+    na_by_col = df[used].isna().sum()
+    keep = out.notna().all(axis=1)
+    info = {"total": len(out), "dropped": int((~keep).sum()),
+            "na_by_col": {c: int(n) for c, n in na_by_col.items() if n}}
+    info["dropped_rate"] = info["dropped"] / max(info["total"], 1)
+    return out[keep], info
+
+
+def other_missing(df: pd.DataFrame, used_cols) -> pd.DataFrame:
+    """RFM에 쓰지 않는 컬럼의 결측 현황과 처리 방법. 행은 제외하지 않는다."""
+    rows = []
+    for c in df.columns:
+        if c in used_cols:
+            continue
+        n = int(df[c].isna().sum())
+        if not n:
+            continue
+        rate = n / len(df)
+        if rate < MISSING_WARN:
+            how = "그대로 사용"
+        elif rate < MISSING_EXCLUDE:
+            how = "사용 (결측이 많아 해석 주의)"
+        else:
+            how = "특성 비교에서 기본 제외"
+        rows.append({"컬럼": c, "결측 수": n, "비율": rate, "처리": how})
+    return pd.DataFrame(rows, columns=["컬럼", "결측 수", "비율", "처리"])
 
 
 def rfm_from_transactions(df, id_col, date_col, invoice_col=None, amount_col=None,

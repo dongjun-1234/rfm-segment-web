@@ -49,7 +49,7 @@ with st.expander("원본 미리보기"):
 
 # ------------------------------------------------------------------ 2. 품질 점검
 st.header("2. 데이터 품질 점검")
-st.caption("분석 전에 꼭 확인해야 할 값들입니다. 처리 방법은 직접 선택하세요.")
+st.caption("분석 전에 꼭 확인해야 할 값들입니다. 결측값은 어떤 컬럼을 R·F·M에 쓰는지 정한 뒤(3단계) 처리합니다.")
 q = rc.quality_report(df_raw)
 
 c1, c2, c3, c4 = st.columns(4)
@@ -62,14 +62,12 @@ df = df_raw.copy()
 notes = []
 
 if q["missing"]:
-    st.subheader("결측값")
-    st.dataframe(pd.Series(q["missing"], name="결측 개수"), width="content")
-    drop_na_cols = st.multiselect("결측값이 있는 행을 제외할 컬럼", list(q["missing"]),
-                                  default=list(q["missing"]))
-    if drop_na_cols:
-        before = len(df)
-        df = df.dropna(subset=drop_na_cols)
-        notes.append(f"결측값 행 {before - len(df)}개 제외 ({', '.join(drop_na_cols)})")
+    st.subheader("결측값 (현황)")
+    miss = pd.DataFrame({"결측 수": pd.Series(q["missing"])})
+    miss["비율"] = (miss["결측 수"] / len(df_raw)).map("{:.1%}".format)
+    st.dataframe(miss, width="content")
+    st.caption("여기서는 현황만 보여줍니다. R·F·M에 쓰는 컬럼이면 그 고객만 제외하고, "
+               "아닌 컬럼은 고객을 빼지 않고 특성 비교에서만 빈 값을 뺍니다. (3단계 컬럼 지정 아래에서 확인)")
 
 if q["constant"]:
     st.subheader("값이 하나뿐인 컬럼")
@@ -118,8 +116,9 @@ if kind.startswith("고객"):
     if not (freq_cols and money_cols):
         st.warning("빈도와 금액 컬럼을 하나 이상 골라 주세요.")
         st.stop()
-    rfm = rc.rfm_from_customer_table(df, None if id_col.startswith("(") else id_col,
-                                     rec_col, freq_cols, money_cols)
+    rfm, miss_info = rc.rfm_from_customer_table(df, None if id_col.startswith("(") else id_col,
+                                                rec_col, freq_cols, money_cols)
+    used_cols = [c for c in [id_col, rec_col] + freq_cols + money_cols if c in df.columns]
     notes.append(f"빈도 = {' + '.join(freq_cols)}")
 else:
     a, b, c = st.columns(3)
@@ -142,8 +141,33 @@ else:
     rfm, log = rc.rfm_from_transactions(df, id_col, date_col,
                                         None if inv_col == "(없음)" else inv_col,
                                         amt_col, qty_col, price_col, ref, drop_neg)
+    miss_info = {"total": log["start"], "dropped": log["dropped_missing"],
+                 "dropped_rate": log["dropped_missing"] / max(log["start"], 1), "unit": "거래"}
+    used_cols = [c for c in [id_col, date_col, inv_col, amt_col, qty_col, price_col] if c and c in df.columns]
     notes.append(f"거래 {log['start']:,}건 → 고객 {log['customers']:,}명 (기준일 {log['ref_date']}, "
                  f"결측 {log['dropped_missing']:,}건·0 이하 {log.get('dropped_nonpositive', 0):,}건 제외)")
+
+# ------------------------------------------------------------------ 결측 처리 (컬럼 지정 후 적용)
+st.subheader("결측값 처리")
+unit = miss_info.get("unit", "고객")
+if miss_info["dropped"]:
+    st.markdown(f"R·F·M 계산에 쓰는 컬럼이 비어 있는 {unit} **{miss_info['dropped']:,}{'건' if unit == '거래' else '명'}"
+                f"({miss_info['dropped_rate']:.1%})** 을 제외했습니다. 컬럼은 그대로 둡니다.")
+    if miss_info["dropped_rate"] >= rc.MISSING_EXCLUDE:
+        st.warning(f"제외된 {unit}이 전체의 {miss_info['dropped_rate']:.0%}입니다. "
+                   "결과가 전체를 대표하지 못할 수 있으니 데이터를 확인해 주세요.")
+    notes.append(f"R·F·M 컬럼 결측으로 {unit} {miss_info['dropped']:,}{'건' if unit == '거래' else '명'} "
+                 f"({miss_info['dropped_rate']:.1%}) 제외")
+else:
+    st.markdown("R·F·M 계산에 쓰는 컬럼에는 빈 값이 없습니다.")
+other_na = rc.other_missing(df, used_cols)
+if len(other_na):
+    st.markdown("R·F·M에 쓰지 않는 컬럼은 고객을 빼지 않고, 특성 비교에서만 빈 값을 빼고 계산합니다.")
+    st.dataframe(other_na.style.format({"비율": "{:.1%}", "결측 수": "{:,}"}), width="content", hide_index=True)
+    for _, r in other_na.iterrows():
+        if r["처리"].startswith("사용 ("):
+            st.warning(f"`{r['컬럼']}`은 결측이 {r['비율']:.1%}로 많아 특성 비교 결과를 해석할 때 주의가 필요해요.")
+        notes.append(f"{r['컬럼']} 결측 {r['결측 수']:,}{'건' if unit == '거래' else '명'}({r['비율']:.1%}) — 제외하지 않음, {r['처리']}")
 
 if len(rfm) < 10:
     st.error("고객 수가 너무 적어 점수를 나눌 수 없습니다.")
